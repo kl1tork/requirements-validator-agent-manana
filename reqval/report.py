@@ -9,6 +9,7 @@ from typing import Any
 
 from . import criteria as C
 from .document import Document
+from .html_report import render as render_html
 from .lint import LintHit
 from .models import Issue, Requirement, RequirementResult, RunInfo, SetResult
 
@@ -93,7 +94,7 @@ class Report:
         w = out.append
         w(f"# Отчёт о проверке требований: {self.doc.title}\n")
         w("Статическое ревью требований до разработки по ISO/IEC/IEEE 29148:2018 (п. 5.2.5, 5.2.6) и "
-          "IEEE Std 830-1998 (п. 4.3). Отчёт сформирован агентом «Манана» автоматически; ссылки «строка N» указывают "
+          "IEEE Std 830-1998 (п. 4.3). Отчёт сформирован агентом «Manana» автоматически; ссылки «строка N» указывают "
           "на номер строки во входном файле.\n")
 
         # 1. паспорт
@@ -106,7 +107,7 @@ class Report:
             ("SHA-256 документа", f"`{i.document_sha256}`"),
             ("Дата прогона", f"{i.started_at} — {i.finished_at}"),
             ("Модель", f"{i.model} (провайдер: {i.provider}, temperature = 0)"),
-            ("Агент", "Манана — агент проверки требований"),
+            ("Агент", "Manana — агент проверки требований"),
             ("Версия агента", f"`{i.agent_version}`"),
             ("Обращений к модели", f"{i.llm_calls} (+ {i.cache_hits} из кэша)"),
             ("Критерии", "ISO/IEC/IEEE 29148:2018 п. 5.2.5, 5.2.6; IEEE Std 830-1998 п. 4.3"),
@@ -337,7 +338,7 @@ class Report:
         written = []
         ext = path.suffix.lower()
         if ext in (".html", ".htm"):
-            path.write_text(_to_html(md, self.doc.title), "utf-8")
+            path.write_text(render_html(self), "utf-8")
         elif ext == ".json":
             path.write_text(json.dumps(self.to_json(), ensure_ascii=False, indent=2), "utf-8")
         else:
@@ -348,6 +349,11 @@ class Report:
             jp = path.with_suffix(".json")
             jp.write_text(json.dumps(self.to_json(), ensure_ascii=False, indent=2), "utf-8")
             written.append(jp)
+        # оформленная веб-версия рядом — открывается в браузере двойным щелчком
+        if ext not in (".html", ".htm"):
+            hp = path.with_suffix(".html")
+            hp.write_text(render_html(self), "utf-8")
+            written.append(hp)
         return written
 
 

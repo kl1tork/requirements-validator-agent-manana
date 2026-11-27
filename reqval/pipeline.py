@@ -43,7 +43,7 @@ def log(msg: str) -> None:
 def run(input_path: Path, output_path: Path, llm: LLMClient, segment_mode: str = "llm",
         batch_size: int = 6, do_verify: bool = True) -> list[Path]:
     t0 = time.time()
-    log("Манана — агент проверки требований")
+    log("Manana — агент проверки требований")
     log(f"1/6 Чтение документа: {input_path}")
     doc = load_document(input_path)
     log(f"    формат {doc.fmt}, строк {len(doc.lines)}, заголовок «{doc.title}»")

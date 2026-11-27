@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from . import AGENT_NAME
 from . import criteria as C
+from .brand import FAVICON, logo
 
 if TYPE_CHECKING:  # pragma: no cover
     from .models import Issue
@@ -114,11 +115,11 @@ def render(rep: "Report") -> str:
     return f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_e(AGENT_NAME)} — отчёт: {_e(doc.title)}</title>
+<title>{_e(AGENT_NAME)} — отчёт: {_e(doc.title)}</title><link rel="icon" href="{FAVICON}">
 <style>{CSS}</style></head>
 <body>
 <header class="top"><div class="wrap">
-  <div class="brand"><span class="logo" aria-hidden="true">M</span>
+  <div class="brand"><span class="logo" aria-hidden="true">{logo(32)}</span>
     <div><b>{_e(AGENT_NAME)}</b><span>агент проверки требований</span></div></div>
   <div class="std">ISO/IEC/IEEE 29148:2018 · IEEE 830-1998</div>
 </div></header>
@@ -168,7 +169,7 @@ font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-ser
 .top{background:var(--navy);color:#fff;border-bottom:3px solid var(--gold)}.top .wrap{display:flex;justify-content:space-between;align-items:center;height:64px}
 .brand{display:flex;gap:12px;align-items:center}.brand b{display:block;font-size:18px;letter-spacing:.3px}
 .brand span{font-size:12px;opacity:.75}.std{font-size:12px;opacity:.7}
-.logo{width:38px;height:38px;border-radius:10px;background:var(--green);display:grid;place-items:center;font-weight:700;font-size:20px}
+.logo{width:42px;height:42px;border-radius:12px;background:#fff;display:grid;place-items:center;font-weight:700;font-size:20px}
 .hero{padding:28px 0 8px}.eyebrow{margin:0;color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:.8px}
 h1{margin:4px 0 18px;font-size:28px;line-height:1.2}h2{margin:0 0 14px;font-size:18px}
 .verdict{display:flex;gap:16px;align-items:flex-start;border-radius:14px;padding:18px 20px;border:1px solid}
