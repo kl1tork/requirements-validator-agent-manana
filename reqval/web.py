@@ -1,11 +1,20 @@
 """Локальное веб-приложение Manana: загрузить документ → посмотреть ход проверки → открыть и скачать отчёт.
 
 Запуск:  python -m reqval.web        (откроется http://127.0.0.1:8765)
+
+Переменные окружения:
+  MANANA_HOST      адрес, на котором слушать (по умолчанию 127.0.0.1; 0.0.0.0 — доступ с телефона по Wi-Fi и в облаке)
+  PORT             порт (по умолчанию 8765; облачные хостинги задают его сами)
+  MANANA_PASSWORD  пароль на вход; обязательно задайте, если открываете приложение в сеть
 Только стандартная библиотека; сервер слушает лишь localhost, ключ LLM берётся из .env как у CLI.
 """
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
+import os
+import socket
 import io
 import json
 import re
@@ -16,17 +25,39 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 from . import AGENT_NAME, __version__
 from .brand import FAVICON, logo
+from .criteria import INDIVIDUAL, SET
 from .config import ROOT, build_llm_config, load_env
 from .document import SUPPORTED
 from .llm import LLMClient, LLMError
+from .web_page import LOGIN_PAGE, MANIFEST, PAGE, SERVICE_WORKER
 
 RUNS = ROOT / "web_runs"
 PORT = 8765
+ICONS = ROOT / "assets" / "icons"
+PUBLIC = {"/manifest.webmanifest", "/sw.js", "/icon-192.png", "/icon-512.png", "/apple-touch-icon.png", "/login"}
+
+
+def _password() -> str:
+    return os.environ.get("MANANA_PASSWORD", "")
+
+
+def _token() -> str:
+    return hmac.new(_password().encode(), b"manana-session", hashlib.sha256).hexdigest()
+
+
+def _lan_ip() -> str:
+    """IP ноутбука в локальной сети — по нему телефон в том же Wi-Fi откроет приложение."""
+    with contextlib.suppress(OSError), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    return ""
 MAX_UPLOAD = 20 * 1024 * 1024
+SAMPLE = ROOT / "input" / "requirements.md"
+CRIT_JSON = json.dumps({c.code: c.name for c in INDIVIDUAL + SET}, ensure_ascii=False)
 OUTPUTS = {"report.html": "text/html; charset=utf-8", "report.md": "text/markdown; charset=utf-8",
            "report.json": "application/json; charset=utf-8"}
 
@@ -66,6 +97,65 @@ def _run_job(job_id: str, src: Path, use_cache: bool) -> None:
             job["state"], job["error"] = "error", f"{type(e).__name__}: {e}"
 
 
+CHAT_SYSTEM = (
+    "Ты — Manana, дружелюбный ИИ-агент и маскот приложения для проверки документов требований "
+    "(зелёный пухлик с золотым ростком). Ты проверяешь требования по ISO/IEC/IEEE 29148:2018 и IEEE Std 830-1998: "
+    "необходимость, однозначность, полнота, атомарность, выполнимость, проверяемость, корректность, прослеживаемость, "
+    "а у набора — полнота, непротиворечивость, понятность, ранжирование. "
+    "Отвечай по-русски, тепло, но по делу и коротко: обычно 2–6 предложений или короткий список. "
+    "Можно использовать **жирный** и списки через «- ». Говори о себе в женском роде. "
+    "Если ниже есть данные отчёта — опирайся только на них, ссылайся на номера замечаний (V-…) и требований (R-…), "
+    "ничего не выдумывай. Если отчёта нет — помогай с формулировкой требований и объясняй, как пользоваться приложением: "
+    "загрузить файл (.pdf, .docx, .md, .txt, .html), нажать «Проверить документ», дождаться отчёта 1–5 минут. "
+    "На темы, не связанные с требованиями и разработкой ПО, вежливо возвращай разговор к делу."
+)
+
+
+def _report_context(run_id: str | None) -> str:
+    """Короткая выжимка отчёта для чата, чтобы модель отвечала по конкретному документу."""
+    if not run_id or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        return ""
+    f = RUNS / run_id / "report.json"
+    if not f.exists():
+        return ""
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    reqs = {r["rid"]: r for r in d.get("requirements", [])}
+    issues, seen = [], set()
+    for r in list(d.get("requirement_results", {}).values()) + [d.get("set_result", {})]:
+        for i in r.get("issues", []):
+            if i.get("status") != "rejected" and i["iid"] not in seen:
+                seen.add(i["iid"])
+                issues.append(i)
+    order = {"critical": 0, "major": 1, "minor": 2}
+    issues.sort(key=lambda i: order.get(i.get("severity"), 3))
+    lines = [f"ДОКУМЕНТ: {d.get('run', {}).get('document_title') or d.get('run', {}).get('document_name')}",
+             f"ВЕРДИКТ: {d.get('verdict')}", f"ВЫВОД: {d.get('review', {}).get('summary', '')}",
+             "ПРИОРИТЕТЫ: " + " | ".join(p.get("text", "") for p in d.get("review", {}).get("priorities", [])),
+             f"ТРЕБОВАНИЙ: {len(reqs)}; ЗАМЕЧАНИЙ: {len(issues)}", "ТРЕБОВАНИЯ:"]
+    lines += [f"{rid}: {r.get('quote') or r.get('summary')}"[:220] for rid, r in reqs.items()]
+    lines.append("ЗАМЕЧАНИЯ:")
+    for i in issues[:80]:
+        q = "; ".join(f"стр.{loc.get('line_start')} «{loc.get('quote')}»" for loc in i.get("locations", [])[:2])
+        lines.append(f"{i['iid']} [{i.get('severity')}, {i.get('criterion')}, {', '.join(i.get('req_ids') or []) or 'набор'}] "
+                     f"{i.get('problem')} ИСПРАВИТЬ: {i.get('fix')} ГДЕ: {q}"[:700])
+    return "\n".join(lines)[:40000]
+
+
+def _chat_reply(messages: list, run_id: str | None) -> str:
+    history = []
+    for m in messages[-16:]:
+        who = "Пользователь" if m.get("role") == "user" else "Manana"
+        history.append(f"{who}: {str(m.get('text', ''))[:2000]}")
+    ctx = _report_context(run_id)
+    user = (("ДАННЫЕ ОТЧЁТА ПО ПОСЛЕДНЕЙ ПРОВЕРКЕ:\n" + ctx + "\n\n") if ctx else "Отчёта пока нет.\n\n") + \
+        "ПЕРЕПИСКА:\n" + "\n".join(history) + "\n\nОтветь на последнее сообщение пользователя как Manana."
+    llm = LLMClient(build_llm_config(no_cache=True), verbose=False)
+    return llm.complete(CHAT_SYSTEM, user, json_mode=False, stage="chat").strip()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"Manana/{__version__}"
 
@@ -85,11 +175,50 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj: dict, code: int = 200) -> None:
         self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
+    def _authed(self) -> bool:
+        if not _password():
+            return True
+        cookies = dict(c.strip().split("=", 1) for c in (self.headers.get("Cookie") or "").split(";") if "=" in c)
+        return hmac.compare_digest(cookies.get("manana", ""), _token())
+
+    def _guard(self) -> bool:
+        """True — запрос можно обслуживать; иначе уже отправлена страница входа или 401."""
+        if self.path.split("?")[0] in PUBLIC or self._authed():
+            return True
+        if self.command == "GET" and self.path.split("?")[0] in ("/", "/index.html"):
+            self._send(200, LOGIN_PAGE.replace("{{ERR}}", "").replace("{{FAVICON}}", FAVICON).encode(), "text/html; charset=utf-8")
+        else:
+            self._json({"error": "Нужно войти: обновите страницу и введите пароль."}, 401)
+        return False
+
+    def _static(self) -> bool:
+        path = self.path.split("?")[0]
+        if path == "/manifest.webmanifest":
+            self._send(200, MANIFEST.encode(), "application/manifest+json; charset=utf-8")
+        elif path == "/sw.js":
+            self._send(200, SERVICE_WORKER.encode(), "text/javascript; charset=utf-8", {"Service-Worker-Allowed": "/"})
+        elif path in ("/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"):
+            f = ICONS / path.lstrip("/")
+            if not f.exists():
+                self._send(404, b"", "text/plain")
+            else:
+                self._send(200, f.read_bytes(), "image/png")
+        else:
+            return False
+        return True
+
     def do_GET(self) -> None:  # noqa: N802
+        if self._static() or not self._guard():
+            return
         if self.path in ("/", "/index.html"):
             return self._send(200, PAGE.replace("{{NAME}}", AGENT_NAME).replace("{{VER}}", __version__)
                               .replace("{{EXT}}", ", ".join(sorted(SUPPORTED)))
-                              .replace("{{LOGO}}", logo(32)).replace("{{FAVICON}}", FAVICON).encode(), "text/html; charset=utf-8")
+                              .replace("{{LOGO}}", logo(32)).replace("{{FAVICON}}", FAVICON)
+                              .replace("{{CRIT}}", CRIT_JSON).encode(), "text/html; charset=utf-8")
+        if self.path == "/sample":
+            if not SAMPLE.exists():
+                return self._send(404, b"", "text/plain")
+            return self._send(200, SAMPLE.read_bytes(), "text/markdown; charset=utf-8", {"X-Filename": SAMPLE.name})
         m = re.fullmatch(r"/status/([0-9a-f]{32})", self.path)
         if m:
             job = _jobs.get(m.group(1))
@@ -104,7 +233,47 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, f.read_bytes(), OUTPUTS[m.group(2)], extra)
         self._send(404, "Не найдено".encode(), "text/plain; charset=utf-8")
 
+    def do_HEAD(self) -> None:  # noqa: N802 — страница проверяет, есть ли пример
+        if self.path == "/sample" and self._authed():
+            self.send_response(200 if SAMPLE.exists() else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_response(405)
+            self.end_headers()
+
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/login":
+            size = min(int(self.headers.get("Content-Length") or 0), 4096)
+            pw = parse_qs(self.rfile.read(size).decode("utf-8", "replace")).get("password", [""])[0]
+            if _password() and hmac.compare_digest(pw, _password()):
+                self.send_response(303)
+                self.send_header("Location", "/")
+                secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+                self.send_header("Set-Cookie", f"manana={_token()}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax{secure}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            return self._send(401, LOGIN_PAGE.replace("{{ERR}}", "Неверный пароль").replace("{{FAVICON}}", FAVICON).encode(),
+                              "text/html; charset=utf-8")
+        if not self._guard():
+            return None
+        if self.path == "/chat":
+            size = int(self.headers.get("Content-Length") or 0)
+            if not 0 < size <= 200_000:
+                return self._json({"error": "Слишком длинное сообщение."}, 400)
+            try:
+                data = json.loads(self.rfile.read(size))
+                msgs = [m for m in data.get("messages", []) if isinstance(m, dict)]
+                if not msgs:
+                    return self._json({"error": "Пустое сообщение."}, 400)
+                return self._json({"reply": _chat_reply(msgs, data.get("run"))})
+            except ValueError:
+                return self._json({"error": "Не получилось прочитать запрос."}, 400)
+            except LLMError as e:
+                return self._json({"error": f"Модель сейчас недоступна: {e}"}, 502)
+            except Exception as e:  # noqa: BLE001
+                return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
         if self.path.split("?")[0] != "/run":
             return self._send(404, b"", "text/plain")
         name = Path(unquote(self.headers.get("X-Filename", "document.txt"))).name
@@ -136,88 +305,25 @@ def main() -> int:
         print(f"Ошибка конфигурации: {e}", file=sys.stderr)
         return 2
     RUNS.mkdir(exist_ok=True)
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    url = f"http://127.0.0.1:{PORT}/"
-    print(f"{AGENT_NAME} запущена: {url}\nЧтобы остановить — закройте это окно или нажмите Ctrl+C.", flush=True)
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    host = os.environ.get("MANANA_HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT") or PORT)
+    local = host in ("127.0.0.1", "localhost")
+    if not local and not _password():
+        print("Внимание: приложение открыто в сеть без пароля. Любой, кто откроет ссылку, будет тратить ваш ключ LLM. "
+              "Задайте MANANA_PASSWORD.", file=sys.stderr)
+    srv = ThreadingHTTPServer((host, port), Handler)
+    url = f"http://127.0.0.1:{port}/"
+    print(f"{AGENT_NAME} запущена: {url}", flush=True)
+    if not local and (ip := _lan_ip()):
+        print(f"С телефона в том же Wi-Fi: http://{ip}:{port}/", flush=True)
+    print("Чтобы остановить — закройте это окно или нажмите Ctrl+C.", flush=True)
+    if local or os.environ.get("MANANA_OPEN_BROWSER") == "1":
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     return 0
-
-
-PAGE = r"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>{{NAME}} — проверка требований</title><link rel="icon" href="{{FAVICON}}">
-<style>
-:root{--green:#0a6b45;--gold:#c9a227;--bg:#f6f7f4;--card:#fff;--text:#14231c;--muted:#5d6b63;--line:#e3e8e3;--bad:#c62828;--badbg:#fdecec}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1612;--card:#15211b;--text:#e8efe9;--muted:#9fb2a6;--line:#24362c;--bad:#ff8a80;--badbg:#3a1c1c}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
-.top{background:var(--green);color:#fff;border-bottom:3px solid var(--gold)}.wrap{max-width:860px;margin:0 auto;padding:0 20px}
-.top .wrap{display:flex;align-items:center;gap:12px;min-height:64px;padding-top:8px;padding-bottom:8px}.logo{width:42px;height:42px;border-radius:12px;background:#fff;
-color:#0a3d28;display:grid;place-items:center;font-weight:700;font-size:20px}.top b{font-size:18px;display:block}.top span{font-size:12px;opacity:.8}
-h1{font-size:26px;margin:28px 0 6px}.lead{color:var(--muted);margin:0 0 20px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px 24px;margin:16px 0}
-.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:0;padding:0;list-style:none}
-.steps li{border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:14px}.steps b{color:var(--gold);display:block;font-size:13px}
-.drop{border:2px dashed var(--line);border-radius:14px;padding:28px;text-align:center;cursor:pointer;transition:.15s}
-.drop:hover,.drop.over{border-color:var(--green);background:rgba(10,107,69,.05)}.drop b{display:block;font-size:16px}.drop small{color:var(--muted)}
-#file{display:none}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:16px}
-button.main{background:var(--green);color:#fff;border:0;border-radius:10px;padding:12px 22px;font-size:15px;font-weight:600;cursor:pointer}
-button.main:disabled{opacity:.5;cursor:default}label.opt{font-size:13px;color:var(--muted)}
-.err{color:var(--bad);background:var(--badbg);border-radius:10px;padding:10px 14px;margin-top:14px;display:none}
-.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:6px 0 14px}.bar i{display:block;height:8px;width:0;background:var(--gold);transition:width .4s}
-.stage{font-weight:600}.log{font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--bg);border-radius:10px;padding:10px 12px;max-height:180px;overflow:auto;color:var(--muted);white-space:pre-wrap}
-.done a{display:inline-block;margin:6px 8px 0 0;border:1px solid var(--line);border-radius:10px;padding:8px 14px;color:var(--text);text-decoration:none;font-size:14px}
-.done a.open{background:var(--green);color:#fff;border-color:var(--green);font-weight:600}
-iframe{width:100%;height:78vh;border:1px solid var(--line);border-radius:14px;margin-top:14px;background:#fff}
-.hidden{display:none}footer{color:var(--muted);font-size:12px;padding:10px 0 40px}
-</style></head><body>
-<header class="top"><div class="wrap"><span class="logo">{{LOGO}}</span><div><b>{{NAME}}</b><span>агент проверки требований · v{{VER}}</span></div></div></header>
-<main class="wrap">
-<h1>Проверка документа требований</h1>
-<p class="lead">Загрузите документ — {{NAME}} разберёт его на требования, проверит по ISO/IEC/IEEE 29148 и IEEE 830 и покажет, что исправить до начала разработки.</p>
-<section class="card"><ol class="steps">
-<li><b>1. Загрузка</b>Выберите файл с требованиями</li><li><b>2. Проверка</b>Агент читает и анализирует, 1–5 минут</li>
-<li><b>3. Отчёт</b>Вердикт, ошибки с цитатами, что исправить</li></ol></section>
-<section class="card" id="up">
-<div class="drop" id="drop"><b>Перетащите документ сюда или нажмите, чтобы выбрать</b><small>Форматы: {{EXT}}</small><div id="fname"></div></div>
-<input type="file" id="file">
-<div class="row"><button class="main" id="go" disabled>Проверить документ</button>
-<label class="opt"><input type="checkbox" id="fresh"> Не брать ответы из кэша (заново спросить модель)</label></div>
-<div class="err" id="err"></div></section>
-<section class="card hidden" id="prog"><div class="stage" id="stage">Подготовка…</div><div class="bar"><i id="bar"></i></div><div class="log" id="log"></div></section>
-<section class="card hidden done" id="done"><div class="stage">Готово — отчёт ниже</div>
-<a class="open" id="aopen" target="_blank">Открыть отчёт в новой вкладке</a><a id="ahtml">Скачать отчёт (.html)</a><a id="amd">Скачать отчёт (.md)</a><a id="ajson">Скачать данные (.json)</a>
-<iframe id="frame" title="Отчёт"></iframe></section>
-<footer>{{NAME}} работает на вашем компьютере; документ отправляется только в выбранную языковую модель (по умолчанию Gemini).</footer>
-</main>
-<script>
-const $=id=>document.getElementById(id);let file=null;
-const pick=f=>{file=f;$('fname').textContent=f?'Выбран: '+f.name:'';$('go').disabled=!f;$('err').style.display='none'};
-$('drop').onclick=()=>$('file').click();$('file').onchange=e=>pick(e.target.files[0]);
-['dragover','dragenter'].forEach(t=>$('drop').addEventListener(t,e=>{e.preventDefault();$('drop').classList.add('over')}));
-['dragleave','drop'].forEach(t=>$('drop').addEventListener(t,e=>{e.preventDefault();$('drop').classList.remove('over')}));
-$('drop').addEventListener('drop',e=>{if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0])});
-const err=m=>{$('err').textContent=m;$('err').style.display='block';$('go').disabled=!file};
-$('go').onclick=async()=>{
- if(!file)return err('Сначала выберите файл.');
- $('go').disabled=true;$('done').classList.add('hidden');$('prog').classList.remove('hidden');$('log').textContent='';$('bar').style.width='3%';
- let r;try{r=await fetch('/run'+($('fresh').checked?'?nocache':''),{method:'POST',headers:{'X-Filename':encodeURIComponent(file.name)},body:file});}
- catch(e){$('prog').classList.add('hidden');return err('Не удалось связаться с приложением. Оно запущено?')}
- const j=await r.json();if(!r.ok){$('prog').classList.add('hidden');return err(j.error||'Ошибка')}
- poll(j.id)};
-async function poll(id){
- const s=await (await fetch('/status/'+id)).json();
- $('log').textContent=s.log.join('\n');$('log').scrollTop=1e9;
- const st=[...s.log].reverse().find(l=>/^\d\/6/.test(l));
- if(st){$('stage').textContent=st.replace(/^(\d)\/6/,'Шаг $1 из 6 —');$('bar').style.width=(+st[0]/6*100)+'%'}
- if(s.state==='done'){$('prog').classList.add('hidden');const b='/runs/'+id+'/';
-  $('aopen').href=b+'report.html';$('ahtml').href=b+'report.html?dl=1';$('amd').href=b+'report.md?dl=1';$('ajson').href=b+'report.json?dl=1';
-  $('frame').src=b+'report.html';$('done').classList.remove('hidden');$('go').disabled=false;$('done').scrollIntoView({behavior:'smooth'});return}
- if(s.state==='error'){$('prog').classList.add('hidden');return err('Проверка остановилась: '+s.error)}
- setTimeout(()=>poll(id),1200)}
-</script></body></html>"""
 
 
 if __name__ == "__main__":
