@@ -6,9 +6,27 @@
 
 Решение для кейса BCC-HUB x MNU FinTech Hackathon — «Агент проверки требований». В коде агент живёт в пакете `reqval`, поэтому команды запуска начинаются с `python -m reqval`.
 
+## Запуск одной командой
+
+```bash
+bash run.sh path/to/requirements.pdf
 ```
-python -m reqval input/requirements.pdf reports/report.md
+
+Команда сама создаёт виртуальное окружение, ставит зависимости из `requirements.txt`, создаёт `.env` из `.env.example` и запускает агента. Отчёт появится в `reports/report.md`. Нужен Python 3.10+ и ключ Gemini (бесплатно: https://aistudio.google.com/apikey) — вставьте его в `.env` в строку `GEMINI_API_KEY=`. Если ключа ещё нет, `run.sh` откроет `.env` и подскажет, что сделать.
+
+Перед этим скачайте репозиторий:
+
+```bash
+git clone https://github.com/kl1tork/requirements-validator-agent-manana.git
+cd requirements-validator-agent-manana
 ```
+
+Документ можно положить в папку `input/` и запустить `bash run.sh input/requirements.pdf`. Поддерживаются `.pdf`, `.docx`, `.md`, `.txt`, `.html`.
+
+Другие варианты:
+
+* веб-приложение: `python -m reqval.web` → http://127.0.0.1:8765 (на macOS — двойной щелчок по `Manana.command`);
+* только агент: `python -m reqval input/requirements.pdf reports/report.md`.
 
 ---
 
@@ -17,8 +35,8 @@ python -m reqval input/requirements.pdf reports/report.md
 ### 1. Установка (Python 3.10+)
 
 ```bash
-git clone <ссылка на этот репозиторий>
-cd requirements-validator-agent
+git clone https://github.com/kl1tork/requirements-validator-agent-manana.git
+cd requirements-validator-agent-manana
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
