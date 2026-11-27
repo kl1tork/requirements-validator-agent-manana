@@ -12,7 +12,7 @@ from .llm import LLMClient, LLMError
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="python -m reqval",
-        description="Агент статической проверки требований (ISO/IEC/IEEE 29148:2018, IEEE 830-1998).",
+        description="Манана — агент статической проверки требований (ISO/IEC/IEEE 29148:2018, IEEE 830-1998).",
     )
     p.add_argument("input", help="путь к документу требований (.pdf, .md, .txt, .docx, .html)")
     p.add_argument("output", nargs="?", default="reports/report.md",
